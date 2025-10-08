@@ -1,0 +1,304 @@
+
+#!/usr/bin/env python3
+"""
+BladeRF 2.0 Channel Sounder Recorder @ 121.7 MHz
+-------------------------------------------------
+- Replaces USRP/UHD timed bursts with continuous SoapySDR streaming.
+- Chunks the stream into bursts of length RX.DURATION and writes NPZ/MAT files.
+- Keeps your existing downstream structure: (rcv, ref, rx_time, gps_info, time_info).
+- No GNSS-disciplined oscillator required; uses bladeRF internal XO.
+
+Requirements:
+    pip install SoapySDR scipy pyyaml numpy
+
+Notes:
+    - Expects your existing WaveformGenerator.Waveform to be available.
+    - If not, a simple fallback tone is used as 'ref' so the pipeline still runs.
+"""
+import os
+import time
+import math
+import yaml
+import queue
+import signal
+import logging
+from datetime import datetime
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.io import savemat
+
+try:
+    # Your existing module that builds the reference waveform
+    from WaveformGenerator import Waveform as WaveformGenerator
+except Exception:
+    WaveformGenerator = None
+
+# SoapySDR / bladeRF 2.0
+import SoapySDR
+from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
+
+# -------------------------
+# Config
+# -------------------------
+
+@dataclass
+class SDRConfig:
+    DRIVER: str = "bladerf"   # Use 'bladerf' for bladeRF 2.0 via SoapySDR
+
+@dataclass
+class BLADERFConf:
+    SAMPLE_RATE: int = 2_000_000   # Hz
+    BANDWIDTH:  int = 1_500_000    # Hz
+    GAIN:       float = 40.0       # dB (tune to avoid clipping)
+    CHANNEL:    int = 0            # RX channel index
+
+@dataclass
+class RFConf:
+    CENTER_FREQ: float = 121_700_000.0  # 121.7 MHz
+
+@dataclass
+class RXConf:
+    DURATION: float = 0.10         # seconds per chunk
+    OUTPUT_TYPE: str = "npz"       # "npz" or "mat"
+    POWER_CALC: bool = True
+    PL_CALC: bool = False          # path loss calc if you provide TX ref separately
+
+@dataclass
+class GPSConf:
+    ENABLED: bool = False          # No GNSS disciplining; set True only to log position if you wire it up
+
+@dataclass
+class CALConf:
+    RX_REF: float = -30.0          # dB offset applied to measured power to estimate dBm (calibrate per setup)
+    TX_REF: float = 0.0            # (optional) reference dBm for PL calculation
+
+@dataclass
+class Config:
+    SDR: SDRConfig = SDRConfig()
+    BLADERF: BLADERFConf = BLADERFConf()
+    RF: RFConf = RFConf()
+    RX: RXConf = RXConf()
+    GPS: GPSConf = GPSConf()
+    CAL: CALConf = CALConf()
+    PERIOD: float = 0.0            # Not used here; continuous capture
+
+    def to_dict(self):
+        # for yaml dump
+        return {
+            "SDR": vars(self.SDR),
+            "BLADERF": vars(self.BLADERF),
+            "RF": vars(self.RF),
+            "RX": vars(self.RX),
+            "GPS": vars(self.GPS),
+            "CAL": vars(self.CAL),
+            "PERIOD": self.PERIOD,
+        }
+
+# -------------------------
+# Receiver
+# -------------------------
+
+class Receiver:
+    def __init__(self, config: Config, plot: int = 0):
+        self.config = config
+        self.plot = plot
+        self.output_type = self.config.RX.OUTPUT_TYPE
+        self.calc_window = 1024  # will be set based on waveform
+
+    def _make_waveform(self):
+        # Try the user's generator; otherwise make a simple tone pulse
+        if WaveformGenerator is not None:
+            wv = WaveformGenerator(self.config)
+            wf = wv.create_waveform()
+            return wf.astype(np.complex64, copy=False)
+        # Fallback: a short complex tone (not used for TX; just to preserve structure)
+        fs = self.config.BLADERF.SAMPLE_RATE
+        dur = 0.05
+        N = int(fs * dur)
+        t = np.arange(N, dtype=np.float32) / fs
+        tone = np.exp(1j * 2 * np.pi * 10e3 * t)  # 10 kHz tone
+        return tone.reshape(1, -1).astype(np.complex64)
+
+    def calc_power(self, sig, logger):
+        # sig shape: (1, N) complex64
+        window = min(self.calc_window, sig.shape[1])
+        p_lin = float(np.var(sig[0, :window]))
+        p_db = 10.0 * math.log10(max(p_lin, 1e-20))
+        p_dbm = p_db + self.config.CAL.RX_REF
+        logger.info(f"Power: {p_dbm:.2f} dBm")
+        return p_dbm
+
+    def process_recv_data(self, rcv_queue, pwr_queue, logger, terminate_event):
+        # Build ref waveform and set power window
+        waveform = self._make_waveform()
+        if waveform.ndim == 1:
+            waveform = waveform.reshape(1, -1)
+        self.calc_window = waveform.shape[1] * 2
+
+        # Prepare output directory
+        out_dir = f"./measurements/{datetime.today().strftime('%Y-%m-%d_%H_%M')}"
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Save the config YAML into the run folder
+        with open(f"{out_dir}/config.yaml", "w") as f:
+            yaml.dump(self.config.to_dict(), f, default_flow_style=False)
+
+        logger.info("Processing thread started")
+
+        while not terminate_event.is_set():
+            try:
+                item = rcv_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            recv_buffer, num_rx_samps, rcv_time, gps_info, time_info = item
+            buff = recv_buffer
+
+            if self.config.RX.POWER_CALC:
+                power_dbm = self.calc_power(buff, logger)
+                if pwr_queue is not None:
+                    pwr_queue.put({"time": time_info, "p_dbm": power_dbm})
+                if self.config.RX.PL_CALC:
+                    pl_db = self.config.CAL.TX_REF - power_dbm
+                    logger.info(f"Pathloss: {pl_db:.2f} dB")
+
+            # Safer filename timestamp (integer microseconds)
+            ts = int(round(rcv_time * 1e6))
+
+            if self.output_type == "npz":
+                np.savez(
+                    f"{out_dir}/received_{ts}.npz",
+                    rcv=buff,
+                    ref=waveform,
+                    rx_time=rcv_time,
+                    gps_info=gps_info,
+                    time_info=time_info,
+                )
+            elif self.output_type == "mat":
+                savemat(
+                    f"{out_dir}/received_{ts}.mat",
+                    {
+                        "buff": buff,
+                        "ref": waveform,
+                        "rx_time": rcv_time,
+                        "gps_info": gps_info,
+                        "time_info": time_info,
+                    },
+                )
+            else:
+                logger.warning(f"Unknown OUTPUT_TYPE={self.output_type}; skipping save.")
+
+    # -------- bladeRF / SoapySDR continuous RX, chunking into bursts --------
+    def receive(self, sdr, rx_stream_unused, logger, rcv_queue, terminate_event, args=None):
+        fs   = int(self.config.BLADERF.SAMPLE_RATE)
+        bw   = int(self.config.BLADERF.BANDWIDTH)
+        gain = float(self.config.BLADERF.GAIN)
+        ch   = int(self.config.BLADERF.CHANNEL)
+        f_rx = float(self.config.RF.CENTER_FREQ)
+
+        logger.info("Configuring bladeRF via SoapySDR...")
+        sdr.setSampleRate(SOAPY_SDR_RX, ch, fs)
+        sdr.setBandwidth(SOAPY_SDR_RX, ch, bw)
+        sdr.setFrequency(SOAPY_SDR_RX, ch, f_rx)
+        sdr.setGain(SOAPY_SDR_RX, ch, gain)
+
+        stream = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [ch])
+        sdr.activateStream(stream)  # start streaming immediately
+        logger.info(f"RX started: f={f_rx/1e6:.3f} MHz, fs={fs/1e6:.3f} MS/s, bw={bw/1e6:.3f} MHz, gain={gain:.1f} dB")
+
+        n_samps = int(fs * self.config.RX.DURATION)
+        if n_samps <= 0:
+            raise ValueError("RX.DURATION too small for current sample rate.")
+
+        buff = np.empty((n_samps,), dtype=np.complex64)
+        timeout_us = int(1e6 * (self.config.RX.DURATION + 0.25))
+
+        try:
+            while not terminate_event.is_set():
+                sr = sdr.readStream(stream, [buff], n_samps, timeoutUs=timeout_us)
+                if sr.ret > 0:
+                    ts_host = time.time()
+                    gps_info = {"lat": 0.0, "lon": 0.0, "alt": 0.0, "speed": 0.0, "hdg": 0.0}
+                    rcv_queue.put((buff.reshape(1, -1).copy(), sr.ret, ts_host, gps_info, ts_host))
+                else:
+                    logger.warning(f"readStream returned {sr.ret}; continuing...")
+        except Exception as ex:
+            logger.error(f"Receive loop error: {ex}")
+        finally:
+            sdr.deactivateStream(stream)
+            sdr.closeStream(stream)
+            logger.info("RX stream stopped.")
+
+# -------------------------
+# Device factory (SoapySDR)
+# -------------------------
+def make_device(config: Config):
+    if config.SDR.DRIVER != "bladerf":
+        raise RuntimeError("This script is for bladeRF via SoapySDR. Set SDR.DRIVER='bladerf'.")
+    args = dict(driver="bladerf")
+    return SoapySDR.Device(args)
+
+# -------------------------
+# Runner
+# -------------------------
+def main():
+    import threading
+    from queue import Queue
+    import argparse
+
+    parser = argparse.ArgumentParser(description="bladeRF 2.0 channel sounder recorder")
+    parser.add_argument("--freq", type=float, default=121.7e6, help="Center frequency in Hz (default 121.7e6)")
+    parser.add_argument("--fs", type=float, default=2e6, help="Sample rate in Hz (default 2e6)")
+    parser.add_argument("--bw", type=float, default=1.5e6, help="Analog bandwidth in Hz (default 1.5e6)")
+    parser.add_argument("--gain", type=float, default=40.0, help="Total RX gain in dB (default 40)")
+    parser.add_argument("--dur", type=float, default=0.10, help="Burst duration in seconds (default 0.10)")
+    parser.add_argument("--out", choices=["npz", "mat"], default="npz", help="Output format (default npz)")
+    args = parser.parse_args()
+
+    # Logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    logger = logging.getLogger("bladerf_sounder")
+
+    # Build config
+    cfg = Config()
+    cfg.RF.CENTER_FREQ = float(args.freq)
+    cfg.BLADERF.SAMPLE_RATE = int(args.fs)
+    cfg.BLADERF.BANDWIDTH = int(args.bw)
+    cfg.BLADERF.GAIN = float(args.gain)
+    cfg.RX.DURATION = float(args.dur)
+    cfg.RX.OUTPUT_TYPE = args.out
+
+    # Queues and threading
+    rcv_queue: Queue = Queue(maxsize=16)
+    pwr_queue: Queue = Queue(maxsize=64)
+    terminate_event = threading.Event()
+
+    # Graceful shutdown
+    def handle_sig(sig, frame):
+        logger.info("Termination signal received, shutting down...")
+        terminate_event.set()
+    signal.signal(signal.SIGINT, handle_sig)
+    signal.signal(signal.SIGTERM, handle_sig)
+
+    # Device
+    sdr = make_device(cfg)
+
+    # Receiver
+    rx = Receiver(cfg, plot=0)
+
+    # Start processing thread
+    proc_thread = threading.Thread(
+        target=rx.process_recv_data, args=(rcv_queue, pwr_queue, logger, terminate_event), daemon=True
+    )
+    proc_thread.start()
+
+    # Start RX loop (blocking)
+    rx.receive(sdr, None, logger, rcv_queue, terminate_event, args=None)
+
+    # Join
+    proc_thread.join(timeout=2.0)
+    logger.info("Done.")
+
+if __name__ == "__main__":
+    main()

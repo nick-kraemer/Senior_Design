@@ -2,20 +2,23 @@ close all
 clear all
 
 %Replace log files with the new logs I generated below are the original
-
 %fname_gps='logs/vehicleOut (1).txt';
 %fname_power="logs/dump.txt";
-fname_gps='logs/GPS6.txt';
-fname_power="logs/Power6.txt";
+fname_gps='logs/GPS5.txt';
+fname_power="logs/Power5.txt";
 
 %Location of the transmitter only for testing
-origin_y = 35.72744374828529;
-origin_x = -78.69606234773077;
+origin_y = 0;
+origin_x = 0;
 
 [timestamp_gps, timestamp_gps_for_csv, GPSx, GPSy, GPSz] = process_csv_GPS(fname_gps);
 
 % --- UPDATED: process_txt_CS now only takes power file and returns 3 outputs ---
 [timestamp_power, mpower, timestamp_power_for_csv] = process_txt_CS(fname_power);
+
+[timestamp_power, idxP] = unique(timestamp_power, 'stable');
+mpower = mpower(idxP);
+timestamp_power_for_csv = timestamp_power_for_csv(idxP,:);
 
 % --- Clean up GPS timestamps: sort + drop exact duplicates ---
 [timestamp_gps, idxSort] = sort(timestamp_gps);      % ensure increasing order
@@ -52,7 +55,6 @@ for i=1:length(timestamp_power)
 end
 
 %Remove measurements before GPS started and after GPS ended
-% (Fixes the original boolean arithmetic bug)
 validindex = find(timestamp_power > timestamp_gps(1) & timestamp_power < timestamp_gps(end));
 
 mX=mX(validindex);
@@ -120,12 +122,16 @@ for i = 1:numel(Xm_all)
     turnmag(i) = mean(abs(dhdg(i0:i)));   % average turning magnitude
 end
 
-% Connector heuristic: very straight AND low turning
 % Make thresholds adaptive to the dataset
 thrStraight = prctile(straightness, 85);      % top 15% straightest windows
 thrTurn     = prctile(turnmag, 25);           % bottom 25% turning windows
-
 isTransit = (straightness >= thrStraight) & (turnmag <= thrTurn);
+
+figure; clf; hold on; axis equal; grid on
+plot(mX(~isTransit), mY(~isTransit), '.', 'MarkerSize', 10);
+plot(mX(isTransit),  mY(isTransit),  'r.', 'MarkerSize', 12);
+legend('kept','flagged as connector');
+title('Check: are we accidentally flagging square edges?');
 
 fprintf('Transit thresholds: straight>=%.3f, turn<=%.3f\n', thrStraight, thrTurn);
 fprintf('Connector-flagged samples: %d / %d\n', nnz(isTransit), numel(isTransit));
@@ -152,7 +158,7 @@ grp = knnsearch(C, XY);
 % From each spatial group, take the top-k RSSI points
 kPer = 12;  % up to 12 strongest per square
 idx_top = [];
-for g = 1:3
+for g = 1:K
     I = find(grp == g & ~isTransit);
     if isempty(I), continue; end
     [~, ord] = sort(mpower(I), 'descend');
@@ -161,7 +167,7 @@ for g = 1:3
 end
 
 % Re-center seeds using only strong points (cleaner cluster centroids)
-[~, C] = kmeans([mX(idx_top) mY(idx_top)], 3, 'MaxIter', 200, 'Replicates', 5);
+[~, C] = kmeans([mX(idx_top) mY(idx_top)], K, 'MaxIter', 200, 'Replicates', 5);
 Nlob = size(C,1);
 
 % ---------- Plan view ----------
@@ -219,10 +225,11 @@ for c = 1:Nlob
     r  = hypot(Xm, Ym);
     w  = exp(-(r.^2)/(2*sigma_m^2));
     w  = w / max(eps, sum(w));
-% === ADD THIS: downweight any transit samples that slipped in ===
-w(isTransit(take)) = 0.1 * w(isTransit(take));   % 10× less influence
-w = w / max(eps, sum(w));
-% ===============================================================
+
+    % (Optional) downweight any transit samples that slipped in
+    w(isTransit(take)) = 0.1 * w(isTransit(take));
+    w = w / max(eps, sum(w));
+
     % --- Weighted plane fit: p ≈ a*X + b*Y + c ---
     Xls  = [Xm, Ym, ones(size(Xm))];
     Xw   = Xls .* w;                        % (kept as in your original style)
@@ -256,12 +263,16 @@ for i = 1:size(X0,1)
     M = M + P;  b = b + P * X0(i,:).';
 end
 x_hat = M \ b;                         % meters relative to (lon0,lat0)
+
 lon_hat = lon0 + x_hat(1)*deg_per_m_lon;
 lat_hat = lat0 + x_hat(2)*deg_per_m_lat;
 
-%% Adaptive radius + P(ELT inside chosen area)  (NO wedges; ALWAYS circle)
+% Mark LS intersection on figure 6
+plot(lon_hat, lat_hat, 'rp', 'MarkerFaceColor', 'y', 'MarkerSize', 12);
 
-% Residual-based covariance from LOB geometry
+%% ===================== CEP-BASED SEARCH AREA + PROBABILITY =====================
+
+% Residual-based covariance from LOB geometry (meters^2)
 e2 = zeros(size(X0,1),1);
 for i = 1:size(X0,1)
     P = eye(2) - (v(i,:).'*v(i,:));
@@ -271,41 +282,77 @@ end
 sigma2 = max(1e-6, median(e2));
 Sigma  = sigma2 * inv(M + 1e-9*eye(2));
 
-% Always use a circular search radius around LS estimate
-d_m = hypot( (LOB_start(:,1)-lon_hat)/deg_per_m_lon, ...
-             (LOB_start(:,2)-lat_hat)/deg_per_m_lat );
+% --- CEP-based circular model ---
+sigma_circ = sqrt(0.5 * trace(Sigma));     % isotropic circular sigma (m)
 
-Rprob_m = 0.9*median(d_m) + 1.8*sqrt(sigma2);
-Rprob_m = max(20, min(150, Rprob_m));
+CEP50 = 1.177 * sigma_circ;                % 50% containment radius
+CEP90 = 2.146 * sigma_circ;                % 90% containment radius
 
+% Choose CEP90 as the operational search radius
+Rprob_m = CEP90;
+
+% CEP closed-form probability within Rprob_m (will be ~0.90 by definition)
+%Rayleigh Function
+P_in = 1 - exp(-(Rprob_m^2)/(2*sigma_circ^2));
+
+fprintf('CEP50 = %.1f m, CEP90 = %.1f m\n', CEP50, CEP90);
+fprintf('Search radius (CEP90) = %.1f m\n', Rprob_m);
+fprintf('P(ELT within search radius) = %.3f (CEP-based)\n', P_in);
+
+% Build the CEP90 circle as the search polygon
 ang = linspace(0, 2*pi, 240).';
 xs = lon_hat + (Rprob_m * deg_per_m_lon) * cos(ang);
 ys = lat_hat + (Rprob_m * deg_per_m_lat) * sin(ang);
 finalPoly = polyshape(xs, ys);
 
-fprintf('Search radius (always) = %.1f m\n', Rprob_m);
+% Build CEP50 circle 
+R50_m = CEP50;
+xs50 = lon_hat + (R50_m * deg_per_m_lon) * cos(ang);
+ys50 = lat_hat + (R50_m * deg_per_m_lat) * sin(ang);
+poly50 = polyshape(xs50, ys50);
 
-% Probability ELT is inside finalPoly (Monte Carlo)
-Nmc = 20000;
-L = chol(Sigma + 1e-9*eye(2), 'lower');
-Xmc = x_hat + L * randn(2, Nmc);
 
-lon_mc = lon0 + Xmc(1,:).' * deg_per_m_lon;
-lat_mc = lat0 + Xmc(2,:).' * deg_per_m_lat;
-
-P_in = mean(isinterior(finalPoly, lon_mc, lat_mc));
-fprintf('P(ELT inside chosen search area) ≈ %.3f\n', P_in);
-
-% Mark LS intersection on figure 6
-plot(lon_hat, lat_hat, 'rp', 'MarkerFaceColor', 'y', 'MarkerSize', 12);
-
-%% Figure 7: Chosen search circle (no wedges)
+%% Figure 7: Chosen search circle (CEP90)
 figure(7); clf; hold on; grid on; axis equal
-xlabel('Longitude'); ylabel('Latitude'); title('Search Area (Circle)')
+xlabel('Longitude'); ylabel('Latitude'); title('Search Area (CEP90 Circle)')
 
 scatter(mX, mY, 6, [0.7 0.7 0.7], 'filled');
 plot(finalPoly, 'FaceColor',[0.85 0.4 0], 'FaceAlpha',0.22, 'EdgeColor','none');
+% CEP50 boundary (inner circle)
+plot(poly50, 'FaceColor','none', 'EdgeColor',[0 0 0], 'LineWidth',2);
+
 plot(lon_hat, lat_hat, 'rp', 'MarkerFaceColor','y', 'MarkerSize',12);
+axis tight; box on;
+
+%% Figure 8: Search Area (CEP90) in Local Meters
+figure(8); clf; hold on; grid on; axis equal
+title('Search Area (CEP90) - Meters')
+xlabel('East (m)'); ylabel('North (m)')
+
+% Same reference used in LS
+lon0 = mean(LOB_start(:,1));
+lat0 = mean(LOB_start(:,2));
+
+% Convert samples to meters
+Xm = (mX - lon0) / deg_per_m_lon;
+Ym = (mY - lat0) / deg_per_m_lat;
+
+% Convert estimated location to meters
+xhat_m = (lon_hat - lon0) / deg_per_m_lon;
+yhat_m = (lat_hat - lat0) / deg_per_m_lat;
+
+% Plot samples
+scatter(Xm, Ym, 6, [0.7 0.7 0.7], 'filled');
+
+% Circles
+ang = linspace(0, 2*pi, 240);
+plot(xhat_m + CEP90*cos(ang), yhat_m + CEP90*sin(ang), 'k-',  'LineWidth',2);   % CEP90
+plot(xhat_m + CEP50*cos(ang), yhat_m + CEP50*sin(ang), 'k--', 'LineWidth',1.5); % CEP50
+
+% Estimated location
+plot(xhat_m, yhat_m, 'rp', 'MarkerFaceColor','y', 'MarkerSize',12);
+
+legend('Measurements','CEP90','CEP50','Estimated ELT','Location','best');
 axis tight; box on;
 
 %% --- Create input.csv for KML generation ---
@@ -340,7 +387,7 @@ fprintf(fid, ['<?xml version="1.0" encoding="UTF-8"?>\n' ...
     '      <PolyStyle><color>40009818</color><fill>1</fill><outline>1</outline></PolyStyle>\n' ...
     '    </Style>\n' ...
     '    <Placemark>\n' ...
-    '      <name>Search Area</name>\n' ...
+    '      <name>Search Area (CEP90)</name>\n' ...
     '      <styleUrl>#elt_region_style</styleUrl>\n' ...
     '      <Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing>\n' ...
     '        <coordinates>\n']);
